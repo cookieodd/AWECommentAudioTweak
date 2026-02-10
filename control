@@ -1,0 +1,9 @@
+Package: com.cookieodd.awecommentaudiotweak
+Name: AWECommentAudioTweak
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 一个平平无奇的音频工具插件。
+Maintainer: cookieodd
+Author: cookieodd
+Section: Tweaks
+Depends: firmware (>= 15.0)
