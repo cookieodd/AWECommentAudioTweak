@@ -1,16 +1,15 @@
-// 工具人实现，苦力都在这
+// 工具方法
 // @cookieodd | github.com/cookieodd | t.me/cookieodd
 
 #import "AWECAUtils.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #include <dlfcn.h>
 
-// libarchive 类型和函数指针，运行时 dlsym 加载
 typedef struct archive archive_t;
 typedef struct archive_entry archive_entry_t;
 typedef int64_t la_int64_t;
 
-// 函数指针，dlsym 一把梭
 static archive_t* (*p_archive_read_new)(void);
 static int (*p_archive_read_support_format_zip)(archive_t*);
 static int (*p_archive_read_support_filter_all)(archive_t*);
@@ -60,7 +59,6 @@ static BOOL loadArchiveLibrary(void) {
 #pragma mark - 路径
 
 + (NSString *)documentsPath {
-    // Documents，音频的家
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     return paths.firstObject;
 }
@@ -81,17 +79,11 @@ static BOOL loadArchiveLibrary(void) {
     return [[self ttsPath] stringByAppendingPathComponent:@"火山引擎"];
 }
 
-+ (NSString *)ttsQwenPath {
-    return [[self ttsPath] stringByAppendingPathComponent:@"千问引擎"];
-}
-
 + (void)ensureDirectoriesExist {
-    // 没目录就建，有就算了
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *audioDir = [self audioSavePath];
     NSString *importDir = [self importPath];
     NSString *volcanoDir = [self ttsVolcanoPath];
-    NSString *qwenDir = [self ttsQwenPath];
 
     if (![fm fileExistsAtPath:audioDir]) {
         [fm createDirectoryAtPath:audioDir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -102,9 +94,6 @@ static BOOL loadArchiveLibrary(void) {
     if (![fm fileExistsAtPath:volcanoDir]) {
         [fm createDirectoryAtPath:volcanoDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    if (![fm fileExistsAtPath:qwenDir]) {
-        [fm createDirectoryAtPath:qwenDir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
 }
 
 #pragma mark - Toast
@@ -114,9 +103,7 @@ static BOOL loadArchiveLibrary(void) {
 }
 
 + (void)showToast:(NSString *)message duration:(NSTimeInterval)duration {
-    // 主线程弹 toast，UIKit 规矩不能破
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 用 keyWindow，不跟着滚
         UIWindow *keyWindow = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
@@ -150,7 +137,6 @@ static BOOL loadArchiveLibrary(void) {
 
         CGFloat width = textSize.width + 32;
         CGFloat height = textSize.height + 20;
-        // 屏幕正中间
         toastLabel.frame = CGRectMake((keyWindow.bounds.size.width - width) / 2,
                                       (keyWindow.bounds.size.height - height) / 2,
                                       width, height);
@@ -176,13 +162,11 @@ static BOOL loadArchiveLibrary(void) {
 + (void)convertAudioAtPath:(NSString *)inputPath
               toOutputPath:(NSString *)outputPath
                 completion:(void(^)(BOOL success, NSError *error))completion {
-    // 文件都不在还转个啥
     if (![[NSFileManager defaultManager] fileExistsAtPath:inputPath]) {
         if (completion) completion(NO, nil);
         return;
     }
 
-    // 本来就是 m4a/aac，直接 copy 完事
     NSString *ext = inputPath.pathExtension.lowercaseString;
     if ([ext isEqualToString:@"m4a"] || [ext isEqualToString:@"aac"]) {
         NSError *error = nil;
@@ -192,7 +176,6 @@ static BOOL loadArchiveLibrary(void) {
         return;
     }
 
-    // 其他格式走 AVAssetExportSession
     NSURL *inputURL = [NSURL fileURLWithPath:inputPath];
     AVAsset *asset = [AVAsset assetWithURL:inputURL];
 
@@ -203,7 +186,6 @@ static BOOL loadArchiveLibrary(void) {
         return;
     }
 
-    // 先删旧文件，不然 export 会炸
     [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
 
     session.outputURL = [NSURL fileURLWithPath:outputPath];
@@ -219,6 +201,93 @@ static BOOL loadArchiveLibrary(void) {
     }];
 }
 
+static NSData *AWECABuildWAV(NSData *pcm, uint32_t sampleRate, uint16_t channels, uint16_t bits) {
+    uint32_t dataSize = (uint32_t)pcm.length;
+    uint32_t byteRate = sampleRate * channels * (bits / 8);
+    uint16_t blockAlign = channels * (bits / 8);
+    uint32_t chunkSize = 36 + dataSize;
+    uint32_t fmtSize = 16;
+    uint16_t audioFormat = 1;
+    NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
+    [wav appendBytes:"RIFF" length:4];
+    [wav appendBytes:&chunkSize length:4];
+    [wav appendBytes:"WAVE" length:4];
+    [wav appendBytes:"fmt " length:4];
+    [wav appendBytes:&fmtSize length:4];
+    [wav appendBytes:&audioFormat length:2];
+    [wav appendBytes:&channels length:2];
+    [wav appendBytes:&sampleRate length:4];
+    [wav appendBytes:&byteRate length:4];
+    [wav appendBytes:&blockAlign length:2];
+    [wav appendBytes:&bits length:2];
+    [wav appendBytes:"data" length:4];
+    [wav appendBytes:&dataSize length:4];
+    [wav appendData:pcm];
+    return wav;
+}
+
++ (void)convertAudioAtPath:(NSString *)inputPath
+              toWAV16kPath:(NSString *)outputPath
+                completion:(void(^)(BOOL success, NSError *error))completion {
+    void (^done)(BOOL, NSError *) = ^(BOOL ok, NSError *err) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, err); });
+        }
+    };
+    if (![[NSFileManager defaultManager] fileExistsAtPath:inputPath]) {
+        done(NO, nil);
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *err = nil;
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:inputPath]
+                                                options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+        AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+        if (!track) { done(NO, nil); return; }
+
+        AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!reader) { done(NO, err); return; }
+
+        NSDictionary *settings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @16000,
+            AVNumberOfChannelsKey: @1,
+            AVLinearPCMBitDepthKey: @16,
+            AVLinearPCMIsNonInterleaved: @NO,
+            AVLinearPCMIsFloatKey: @NO,
+            AVLinearPCMIsBigEndianKey: @NO
+        };
+        AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+        output.alwaysCopiesSampleData = YES;
+        if (![reader canAddOutput:output]) { done(NO, nil); return; }
+        [reader addOutput:output];
+        if (![reader startReading]) { done(NO, reader.error); return; }
+
+        NSMutableData *pcm = [NSMutableData data];
+        while (reader.status == AVAssetReaderStatusReading) {
+            CMSampleBufferRef sb = [output copyNextSampleBuffer];
+            if (!sb) break;
+            CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+            if (bb) {
+                size_t len = CMBlockBufferGetDataLength(bb);
+                if (len > 0) {
+                    NSMutableData *chunk = [NSMutableData dataWithLength:len];
+                    if (CMBlockBufferCopyDataBytes(bb, 0, len, chunk.mutableBytes) == kCMBlockBufferNoErr) {
+                        [pcm appendData:chunk];
+                    }
+                }
+            }
+            CFRelease(sb);
+        }
+        if (pcm.length == 0) { done(NO, reader.error); return; }
+
+        NSData *wav = AWECABuildWAV(pcm, 16000, 1, 16);
+        [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
+        BOOL ok = [wav writeToFile:outputPath atomically:YES];
+        done(ok, nil);
+    });
+}
+
 #pragma mark - 时长
 
 + (double)audioDurationAtPath:(NSString *)path {
@@ -231,7 +300,6 @@ static BOOL loadArchiveLibrary(void) {
 #pragma mark - 文件名
 
 + (NSString *)generateFilenameForCommentID:(NSString *)commentID duration:(long long)duration {
-    // 评论ID_时长_时间戳.m4a
     NSTimeInterval ts = [[NSDate date] timeIntervalSince1970];
     return [NSString stringWithFormat:@"评论_%@_%llds_%.0f.m4a",
             commentID ?: @"unknown", duration, ts];
@@ -239,10 +307,8 @@ static BOOL loadArchiveLibrary(void) {
 
 + (NSString *)sanitizeFilename:(NSString *)name maxLength:(NSUInteger)maxLen {
     if (!name || name.length == 0) return @"未命名";
-    // 干掉文件名非法字符
     NSCharacterSet *illegal = [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|"];
     NSString *clean = [[name componentsSeparatedByCharactersInSet:illegal] componentsJoinedByString:@""];
-    // 去首尾空格
     clean = [clean stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (clean.length == 0) return @"未命名";
     if (clean.length > maxLen) clean = [clean substringToIndex:maxLen];
@@ -274,7 +340,6 @@ static BOOL loadArchiveLibrary(void) {
     while (vc.presentedViewController) {
         vc = vc.presentedViewController;
     }
-    // 导航控制器就拿 top
     if ([vc isKindOfClass:[UINavigationController class]]) {
         vc = ((UINavigationController *)vc).topViewController;
     }
@@ -319,7 +384,6 @@ static BOOL loadArchiveLibrary(void) {
         if (!entryPath) continue;
 
         NSString *entryName = [NSString stringWithUTF8String:entryPath];
-        // 跳过 macOS 的 __MACOSX 垃圾
         if ([entryName hasPrefix:@"__MACOSX"] || [entryName hasPrefix:@"."]) {
             p_archive_read_data_skip(a);
             continue;

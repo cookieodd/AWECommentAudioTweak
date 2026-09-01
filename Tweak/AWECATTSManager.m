@@ -1,19 +1,82 @@
-// TTS 管理器impl，火山引擎API一把梭
+// 豆包 TTS 管理器
 // @cookieodd | github.com/cookieodd | t.me/cookieodd
 
 #import "AWECATTSManager.h"
 #import "AWECAUtils.h"
 #import "AWECAAudioReplacer.h"
+#import <math.h>
+#import <string.h>
 
-// 无默认凭证，用户必须在配置页填写
-#define kDefaultCluster     @"volcano_tts"
-#define kDefaultVoiceType   @"BV700_V2_streaming"
-#define kDefaultVoiceName   @"灿灿"
+#define kDefaultVoiceType   @"zh_female_cancan_uranus_bigtts"
 
-// 火山 API 地址
-#define kTTSAPIURL @"https://openspeech.bytedance.com/api/v1/tts"
-// 千问 API 地址
-#define kQwenTTSAPIURL @"https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+#define kTTSV3UnidirURL @"https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+#define kTTSResourceTTS2 @"seed-tts-2.0"
+
+static NSString *AWECATrim(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return @"";
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *AWECAHeader(NSDictionary *headers, NSString *key) {
+    if (![headers isKindOfClass:[NSDictionary class]] || !key.length) return nil;
+    id v = headers[key];
+    if ([v isKindOfClass:[NSString class]]) return v;
+    for (NSString *k in headers) {
+        if ([k caseInsensitiveCompare:key] == NSOrderedSame) {
+            id x = headers[k];
+            return [x isKindOfClass:[NSString class]] ? x : nil;
+        }
+    }
+    return nil;
+}
+
+static NSArray<NSDictionary *> *AWECAJSONObjectsFromData(NSData *data) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!data.length) return out;
+    const uint8_t *bytes = data.bytes;
+    NSUInteger len = data.length;
+    NSUInteger i = 0;
+    while (i < len) {
+        while (i < len && bytes[i] <= 32) i++;
+        if (i >= len) break;
+        if (i + 5 <= len && memcmp(bytes + i, "data:", 5) == 0) {
+            i += 5;
+            while (i < len && bytes[i] == ' ') i++;
+        } else if (i + 6 <= len && memcmp(bytes + i, "event:", 6) == 0) {
+            while (i < len && bytes[i] != '\n') i++;
+            continue;
+        }
+        if (i >= len || bytes[i] != '{') { i++; continue; }
+        NSUInteger start = i;
+        int depth = 0;
+        BOOL inStr = NO, esc = NO;
+        BOOL closed = NO;
+        for (; i < len; i++) {
+            char c = (char)bytes[i];
+            if (inStr) {
+                if (esc) esc = NO;
+                else if (c == '\\') esc = YES;
+                else if (c == '"') inStr = NO;
+                continue;
+            }
+            if (c == '"') inStr = YES;
+            else if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    NSData *one = [data subdataWithRange:NSMakeRange(start, i - start + 1)];
+                    id obj = [NSJSONSerialization JSONObjectWithData:one options:0 error:nil];
+                    if ([obj isKindOfClass:[NSDictionary class]]) [out addObject:obj];
+                    i++;
+                    closed = YES;
+                    break;
+                }
+            }
+        }
+        if (!closed) break;
+    }
+    return out;
+}
 
 @interface AWECATTSManager ()
 @property (nonatomic, strong) AVAudioPlayer *player;
@@ -32,7 +95,7 @@
     return instance;
 }
 
-#pragma mark - 合成语音，核心逻辑
+#pragma mark - 合成
 
 - (void)synthesizeText:(NSString *)text
             completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
@@ -52,48 +115,146 @@
         return;
     }
 
-    // 根据后端分发
-    if (self.ttsProvider == AWECATTSProviderQwen) {
-        [self synthesizeWithQwen:text previewOnly:previewOnly completion:completion];
+    [self synthesizeVolcanoV3Text:text previewOnly:previewOnly completion:completion];
+}
+
+- (void)synthesizeVolcanoPreviewText:(NSString *)text
+                          completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
+    [self synthesizeVolcanoV3Text:text previewOnly:YES completion:completion];
+}
+
+static int aweca_mapRatioToV3(float ratio, int scale, int lo, int hi) {
+    if (ratio < 0.01f) ratio = 1.0f;
+    int v = (int)lround((ratio - 1.0f) * (double)scale);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+
+static int aweca_mapPitchToV3(float ratio) {
+    int v = (int)lround((ratio - 1.0f) * 12.0);
+    if (v < -12) v = -12;
+    if (v > 12) v = 12;
+    return v;
+}
+
++ (NSString *)canonicalDialect:(NSString *)raw {
+    NSString *s = AWECATrim(raw);
+    if (!s.length) return @"";
+    NSString *l = s.lowercaseString;
+    if ([s isEqualToString:@"东北"] || [l isEqualToString:@"dongbei"]) return @"dongbei";
+    if ([s isEqualToString:@"陕西"] || [l isEqualToString:@"shaanxi"]) return @"shaanxi";
+    if ([s isEqualToString:@"四川"] || [l isEqualToString:@"sichuan"]) return @"sichuan";
+    return @"";
+}
+
+- (BOOL)currentVoiceSupportsDialect {
+    return [[self volcanoTTS2Speaker] isEqualToString:kAWECATTSDialectSpeaker];
+}
+
+- (NSString *)volcanoSpeakerId {
+    if (self.voiceType.length > 0) return self.voiceType;
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:kAWECATTSVolcanoVoiceType];
+    if (saved.length > 0) return saved;
+    return kDefaultVoiceType;
+}
+
+- (NSString *)volcanoTTS2Speaker {
+    NSString *s = [self volcanoSpeakerId] ?: @"";
+    NSString *l = [s lowercaseString];
+    if ([l containsString:@"uranus"]) return s;
+
+    static NSDictionary *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"saturn_zh_female_cancan_tob": @"zh_female_cancan_uranus_bigtts",
+            @"BV700_V2_streaming": @"zh_female_cancan_uranus_bigtts",
+            @"zh_female_cancan_mars_bigtts": @"zh_female_cancan_uranus_bigtts",
+            @"BV001_V2_streaming": @"zh_female_vv_uranus_bigtts",
+            @"BV002_V2_streaming": @"zh_male_m191_uranus_bigtts",
+            @"BV113_streaming": @"zh_male_taocheng_uranus_bigtts",
+            @"BV102_streaming": @"zh_female_xiaohe_uranus_bigtts",
+            @"BV406_V2_streaming": @"zh_male_m191_uranus_bigtts",
+            @"BV405_streaming": @"zh_female_qingchezizi_uranus_bigtts",
+            @"zh_female_xueayi_saturn_bigtts": @"zh_female_xiaoxue_uranus_bigtts",
+            @"zh_female_santongyongns_saturn_bigtts": @"zh_female_liuchangnv_uranus_bigtts",
+        };
+    });
+    NSString *mapped = map[s];
+    if (mapped.length) return mapped;
+    if ([s hasPrefix:@"saturn_"]) {
+        return [@"ICL_uranus_" stringByAppendingString:[s substringFromIndex:7]];
+    }
+    if ([l containsString:@"saturn"]) {
+        return [s stringByReplacingOccurrencesOfString:@"saturn" withString:@"uranus"];
+    }
+    return kDefaultVoiceType;
+}
+
+- (NSString *)volcanoTTSAdditionsJSON {
+    NSMutableDictionary *add = [NSMutableDictionary dictionary];
+    int pitch = aweca_mapPitchToV3(self.pitchRatio);
+    if (pitch != 0) {
+        add[@"post_process"] = @{ @"pitch": @(pitch) };
+    }
+    NSString *ctx = AWECATrim(self.contextText);
+    if (ctx.length) add[@"context_texts"] = @[ctx];
+    NSString *dialect = [AWECATTSManager canonicalDialect:self.explicitDialect];
+    if (dialect.length && [self currentVoiceSupportsDialect]) {
+        add[@"explicit_dialect"] = dialect;
+    }
+    if (self.silenceDurationMs > 0) add[@"silence_duration"] = @(self.silenceDurationMs);
+    if (add.count == 0) return nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:add options:0 error:nil];
+    if (!data.length) return nil;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+- (void)applyVolcanoHTTPAuthToRequest:(NSMutableURLRequest *)request {
+    if (!request) return;
+    NSString *token = AWECATrim(self.accessToken);
+    NSString *appID = AWECATrim(self.appID);
+    if (token.length > 0) {
+        [request setValue:token forHTTPHeaderField:@"X-Api-Key"];
+        [request setValue:token forHTTPHeaderField:@"X-Api-Access-Key"];
+    }
+    if (appID.length > 0) {
+        [request setValue:appID forHTTPHeaderField:@"X-Api-App-Id"];
+    }
+}
+
+- (void)synthesizeVolcanoV3Text:(NSString *)text
+                    previewOnly:(BOOL)previewOnly
+                     completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
+    if (!text.length) {
+        if (completion) completion(NO, nil, @"请输入要合成的文字");
+        return;
+    }
+    NSString *token = AWECATrim(self.accessToken);
+    NSString *appID = AWECATrim(self.appID);
+    if (token.length == 0 && appID.length == 0) {
+        if (completion) completion(NO, nil, @"请先填写火山 API Key");
         return;
     }
 
-    // === 火山引擎合成 ===
-
-    // 凭证必填，没配就拦住
-    if (self.appID.length == 0 || self.accessToken.length == 0) {
-        if (completion) completion(NO, nil, @"请先在配置页填写 App ID 和 Access Token");
-        return;
-    }
-
-    NSString *appid = self.appID;
-    NSString *token = self.accessToken;
-    NSString *cluster = (self.cluster.length > 0) ? self.cluster : kDefaultCluster;
-    NSString *voice = (self.voiceType.length > 0) ? self.voiceType : kDefaultVoiceType;
-
-    // 构造请求体
-    NSDictionary *body = @{
-        @"app": @{
-            @"appid": appid,
-            @"token": token,
-            @"cluster": cluster
-        },
-        @"user": @{
-            @"uid": @"aweca_user"
-        },
-        @"audio": @{
-            @"voice_type": voice,
-            @"encoding": @"mp3",
-            @"speed_ratio": @(self.speedRatio > 0 ? self.speedRatio : 1.0),
-            @"volume_ratio": @(self.volumeRatio > 0 ? self.volumeRatio : 1.0),
-            @"pitch_ratio": @(self.pitchRatio > 0 ? self.pitchRatio : 1.0)
-        },
-        @"request": @{
-            @"reqid": [[NSUUID UUID] UUIDString],
-            @"text": text,
-            @"text_type": @"plain",
-            @"operation": @"query"
+    NSString *speaker = [self volcanoTTS2Speaker];
+    NSMutableDictionary *reqParams = [@{
+        @"text": text,
+        @"speaker": speaker,
+        @"audio_params": @{
+            @"format": @"mp3",
+            @"sample_rate": @24000,
+            @"speech_rate": @(aweca_mapRatioToV3(self.speedRatio, 100, -50, 100)),
+            @"loudness_rate": @(aweca_mapRatioToV3(self.volumeRatio, 100, -50, 100))
         }
+    } mutableCopy];
+    NSString *additions = [self volcanoTTSAdditionsJSON];
+    if (additions.length) reqParams[@"additions"] = additions;
+
+    NSDictionary *body = @{
+        @"user": @{ @"uid": appID.length ? appID : @"aweca_user" },
+        @"req_params": reqParams
     };
 
     NSError *jsonErr = nil;
@@ -103,82 +264,114 @@
         return;
     }
 
-    // 构造 HTTP 请求
-    NSURL *url = [NSURL URLWithString:kTTSAPIURL];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kTTSV3UnidirURL]];
     request.HTTPMethod = @"POST";
     request.HTTPBody = jsonData;
+    request.timeoutInterval = 45;
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    // 认证头，格式: Bearer;{token}
-    NSString *authHeader = [NSString stringWithFormat:@"Bearer;%@", token];
-    [request setValue:authHeader forHTTPHeaderField:@"Authorization"];
-    request.timeoutInterval = 30;
+    [request setValue:[[NSUUID UUID] UUIDString] forHTTPHeaderField:@"X-Api-Request-Id"];
+    [request setValue:kTTSResourceTTS2 forHTTPHeaderField:@"X-Api-Resource-Id"];
+    [self applyVolcanoHTTPAuthToRequest:request];
 
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-
-    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (completion) completion(NO, nil, [NSString stringWithFormat:@"网络错误: %@", error.localizedDescription]);
             });
             return;
         }
-
-        if (!data) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        NSString *apiCode = AWECAHeader(http.allHeaderFields, @"X-Api-Status-Code");
+        NSString *apiMsg = AWECAHeader(http.allHeaderFields, @"X-Api-Message");
+        if (apiCode.length && ![apiCode isEqualToString:@"20000000"] && ![apiCode isEqualToString:@"0"]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, nil, [NSString stringWithFormat:@"合成错误(%@): %@", apiCode, apiMsg.length ? apiMsg : @"失败"]);
+            });
+            return;
+        }
+        if (!data.length) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (completion) completion(NO, nil, @"服务器无响应");
             });
             return;
         }
-
-        [self parseResponse:data text:text previewOnly:previewOnly completion:completion];
+        [self parseV3TTSResponse:data text:text previewOnly:previewOnly completion:completion];
     }] resume];
 }
 
 #pragma mark - 解析响应
 
-- (void)parseResponse:(NSData *)data
-                 text:(NSString *)text
-          previewOnly:(BOOL)previewOnly
-           completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
-    NSError *jsonErr = nil;
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-
-    if (jsonErr || !json) {
+- (void)parseV3TTSResponse:(NSData *)data
+                      text:(NSString *)text
+               previewOnly:(BOOL)previewOnly
+                completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
+    NSArray *chunks = AWECAJSONObjectsFromData(data);
+    if (!chunks.count) {
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([json isKindOfClass:[NSDictionary class]]) chunks = @[json];
+    }
+    if (!chunks.count) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) completion(NO, nil, @"响应解析失败");
         });
         return;
     }
 
-    NSInteger code = [json[@"code"] integerValue];
-    if (code != 3000) {
-        NSString *msg = json[@"message"] ?: @"未知错误";
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(NO, nil, [NSString stringWithFormat:@"API错误(%ld): %@", (long)code, msg]);
-        });
+    NSMutableData *audioBuf = [NSMutableData data];
+    NSString *errMsg = nil;
+    NSInteger errCode = 0;
+    for (NSDictionary *json in chunks) {
+        NSInteger code = [json[@"code"] integerValue];
+        BOOL codeOK = (!json[@"code"] || code == 0 || code == 20000000);
+        if (!codeOK) {
+            errCode = code;
+            errMsg = json[@"message"] ?: @"未知错误";
+            continue;
+        }
+        NSString *b64 = json[@"data"];
+        if (![b64 isKindOfClass:[NSString class]] || b64.length == 0) {
+            b64 = json[@"audio"];
+        }
+        if ([b64 isKindOfClass:[NSString class]] && b64.length > 0) {
+            NSData *part = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            if (part.length) [audioBuf appendData:part];
+        }
+    }
+
+    if (audioBuf.length) {
+        [self finishWithAudioData:audioBuf text:text previewOnly:previewOnly completion:completion];
         return;
     }
 
-    NSString *b64Data = json[@"data"];
-    if (!b64Data || b64Data.length == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+    NSDictionary *last = chunks.lastObject;
+    NSString *url = last[@"url"];
+    if ([url isKindOfClass:[NSString class]] && url.length > 0) {
+        [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:url] completionHandler:^(NSData *audioData, NSURLResponse *resp, NSError *err) {
+            if (err || !audioData.length) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (completion) completion(NO, nil, err.localizedDescription ?: @"音频下载失败");
+                });
+                return;
+            }
+            [self finishWithAudioData:audioData text:text previewOnly:previewOnly completion:completion];
+        }] resume];
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (errMsg.length) {
+            if (completion) completion(NO, nil, [NSString stringWithFormat:@"合成错误(%ld): %@", (long)errCode, errMsg]);
+        } else {
             if (completion) completion(NO, nil, @"音频数据为空");
-        });
-        return;
-    }
+        }
+    });
+}
 
-    // base64 解码
-    NSData *audioData = [[NSData alloc] initWithBase64EncodedString:b64Data options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    if (!audioData || audioData.length == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(NO, nil, @"音频解码失败");
-        });
-        return;
-    }
+- (void)finishWithAudioData:(NSData *)audioData
+                       text:(NSString *)text
+                previewOnly:(BOOL)previewOnly
+                 completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
 
-    // 写入临时文件
     [AWECAUtils ensureDirectoriesExist];
     NSString *savePath = [[AWECAUtils audioSavePath] stringByAppendingPathComponent:@"tts_result.mp3"];
     BOOL writeOK = [audioData writeToFile:savePath atomically:YES];
@@ -190,31 +383,27 @@
         return;
     }
 
-    // 保存路径
     self.lastSynthesizedPath = savePath;
     [self saveConfig];
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 试听模式直接返回
         if (previewOnly) {
             if (completion) completion(YES, savePath, nil);
             return;
         }
 
-        // 先存到 ttsAudioPath
         AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
         replacer.ttsAudioPath = savePath;
         [replacer saveState];
 
         NSString *vName = (self.voiceName.length > 0) ? self.voiceName : @"未知音色";
 
-        // 检测是否有普通音频冲突
         BOOL hasNormalAudio = replacer.enabled && replacer.replacementAudioPath.length > 0 && !replacer.isUsingTTS;
         if (hasNormalAudio) {
-            [self showTTSConflictAlertWithPath:savePath text:text voiceName:vName provider:AWECATTSProviderVolcano completion:completion];
+            [self showTTSConflictAlertWithPath:savePath text:text voiceName:vName completion:completion];
         } else {
             __weak AWECAAudioReplacer *weakReplacer = replacer;
-            [replacer setReplacementFromTTSPath:savePath text:text voiceName:vName provider:AWECATTSProviderVolcano completion:^(BOOL ok) {
+            [replacer setReplacementFromTTSPath:savePath text:text voiceName:vName completion:^(BOOL ok) {
                 if (completion) {
                     if (ok) {
                         double dur = [AWECAUtils audioDurationAtPath:weakReplacer.replacementAudioPath];
@@ -229,173 +418,15 @@
     });
 }
 
-#pragma mark - 千问合成
-
-- (void)synthesizeWithQwen:(NSString *)text
-               previewOnly:(BOOL)previewOnly
-                completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
-    if (self.qwenAPIKey.length == 0) {
-        if (completion) completion(NO, nil, @"请先在配置页填写千问 API Key");
-        return;
-    }
-
-    NSString *voice = (self.voiceType.length > 0) ? self.voiceType : @"Cherry";
-
-    // 构造请求体
-    NSDictionary *body = @{
-        @"model": @"qwen3-tts-flash",
-        @"input": @{
-            @"text": text,
-            @"voice": voice
-        }
-    };
-
-    NSError *jsonErr = nil;
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&jsonErr];
-    if (jsonErr || !jsonData) {
-        if (completion) completion(NO, nil, @"请求构造失败");
-        return;
-    }
-
-    NSURL *url = [NSURL URLWithString:kQwenTTSAPIURL];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.HTTPMethod = @"POST";
-    request.HTTPBody = jsonData;
-    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [request setValue:[NSString stringWithFormat:@"Bearer %@", self.qwenAPIKey] forHTTPHeaderField:@"Authorization"];
-    request.timeoutInterval = 30;
-
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-
-    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, nil, [NSString stringWithFormat:@"网络错误: %@", error.localizedDescription]);
-            });
-            return;
-        }
-        if (!data) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, nil, @"服务器无响应");
-            });
-            return;
-        }
-        [self parseQwenResponse:data text:text previewOnly:previewOnly completion:completion];
-    }] resume];
-}
-
-- (void)parseQwenResponse:(NSData *)data
-                     text:(NSString *)text
-              previewOnly:(BOOL)previewOnly
-               completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
-    NSError *jsonErr = nil;
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-
-    if (jsonErr || !json) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(NO, nil, @"响应解析失败");
-        });
-        return;
-    }
-
-    // 检查错误码
-    NSString *code = json[@"code"];
-    if (code) {
-        NSString *msg = json[@"message"] ?: @"未知错误";
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(NO, nil, [NSString stringWithFormat:@"千问错误: %@", msg]);
-        });
-        return;
-    }
-
-    // 拿音频 URL: output.audio.url
-    NSDictionary *output = json[@"output"];
-    NSDictionary *audio = output[@"audio"];
-    NSString *audioURL = audio[@"url"];
-
-    if (!audioURL || audioURL.length == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (completion) completion(NO, nil, @"音频地址为空");
-        });
-        return;
-    }
-
-    // 下载音频文件
-    NSURL *downloadURL = [NSURL URLWithString:audioURL];
-    NSURLSessionConfiguration *dlConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
-    NSURLSession *dlSession = [NSURLSession sessionWithConfiguration:dlConfig];
-
-    [[dlSession dataTaskWithURL:downloadURL completionHandler:^(NSData *audioData, NSURLResponse *resp, NSError *dlErr) {
-        if (dlErr || !audioData || audioData.length == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, nil, @"音频下载失败");
-            });
-            return;
-        }
-
-        // 保存临时文件
-        [AWECAUtils ensureDirectoriesExist];
-        NSString *savePath = [[AWECAUtils audioSavePath] stringByAppendingPathComponent:@"qwen_tts_result.wav"];
-        BOOL writeOK = [audioData writeToFile:savePath atomically:YES];
-
-        if (!writeOK) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, nil, @"音频保存失败");
-            });
-            return;
-        }
-
-        self.lastSynthesizedPath = savePath;
-        [self saveConfig];
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            // 试听模式直接返回
-            if (previewOnly) {
-                if (completion) completion(YES, savePath, nil);
-                return;
-            }
-
-            // 先存到 ttsAudioPath
-            AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
-            replacer.ttsAudioPath = savePath;
-            [replacer saveState];
-
-            NSString *vName = (self.voiceName.length > 0) ? self.voiceName : @"未知音色";
-
-            // 检测是否有普通音频冲突
-            BOOL hasNormalAudio = replacer.enabled && replacer.replacementAudioPath.length > 0 && !replacer.isUsingTTS;
-            if (hasNormalAudio) {
-                [self showTTSConflictAlertWithPath:savePath text:text voiceName:vName provider:AWECATTSProviderQwen completion:completion];
-            } else {
-                __weak AWECAAudioReplacer *weakReplacer = replacer;
-                [replacer setReplacementFromTTSPath:savePath text:text voiceName:vName provider:AWECATTSProviderQwen completion:^(BOOL ok) {
-                    if (completion) {
-                        if (ok) {
-                            double dur = [AWECAUtils audioDurationAtPath:weakReplacer.replacementAudioPath];
-                            [AWECAUtils showToast:@"成功合成！随意录制语音评论即可自动替换" duration:3.0];
-                            completion(YES, weakReplacer.replacementAudioPath, [NSString stringWithFormat:@"语音合成成功 (%.1f秒)", dur]);
-                        } else {
-                            completion(NO, savePath, @"合成成功但设置替换失败");
-                        }
-                    }
-                }];
-            }
-        });
-    }] resume];
-}
-
 #pragma mark - 冲突选择器
 
 - (void)showTTSConflictAlertWithPath:(NSString *)ttsPath
                                 text:(NSString *)text
                            voiceName:(NSString *)voiceName
-                            provider:(AWECATTSProvider)provider
                           completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
     UIViewController *topVC = [AWECAUtils topViewController];
     if (!topVC) {
-        // 没VC就直接覆盖，别卡死
-        [[AWECAAudioReplacer shared] setReplacementFromTTSPath:ttsPath text:text voiceName:voiceName provider:provider completion:^(BOOL ok) {
+        [[AWECAAudioReplacer shared] setReplacementFromTTSPath:ttsPath text:text voiceName:voiceName completion:^(BOOL ok) {
             if (completion) completion(ok, ttsPath, ok ? @"语音合成成功" : @"设置替换失败");
         }];
         return;
@@ -408,7 +439,7 @@
     [alert addAction:[UIAlertAction actionWithTitle:@"使用Ai" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
         __weak AWECAAudioReplacer *weakReplacer = replacer;
-        [replacer setReplacementFromTTSPath:ttsPath text:text voiceName:voiceName provider:provider completion:^(BOOL ok) {
+        [replacer setReplacementFromTTSPath:ttsPath text:text voiceName:voiceName completion:^(BOOL ok) {
             if (completion) {
                 if (ok) {
                     double dur = [AWECAUtils audioDurationAtPath:weakReplacer.replacementAudioPath];
@@ -422,7 +453,6 @@
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"不使用Ai" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        // ttsAudioPath 已存好，不动 replacementAudioPath
         if (completion) completion(YES, ttsPath, @"合成已保存，当前使用普通语音");
     }]];
 
@@ -457,7 +487,6 @@
 
     self.player.delegate = self;
 
-    // 设置音频会话，混合播放不打断别人
     AVAudioSession *audioSession = [AVAudioSession sharedInstance];
     [audioSession setCategory:AVAudioSessionCategoryPlayback
                   withOptions:AVAudioSessionCategoryOptionMixWithOthers
@@ -478,7 +507,6 @@
     return self.player && self.player.isPlaying;
 }
 
-// 播完了自动清理
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
     self.player = nil;
 }
@@ -487,45 +515,40 @@
 
 - (void)saveConfig {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    // 后端选择
-    [d setInteger:self.ttsProvider forKey:kAWECATTSProvider];
-    // 火山引擎
     if (self.appID) [d setObject:self.appID forKey:kAWECATTSAppID];
     if (self.accessToken) [d setObject:self.accessToken forKey:kAWECATTSAccessToken];
-    if (self.cluster) [d setObject:self.cluster forKey:kAWECATTSCluster];
-    // 千问
-    if (self.qwenAPIKey) [d setObject:self.qwenAPIKey forKey:kAWECATTSQwenAPIKey];
-    // 通用
     if (self.voiceType) [d setObject:self.voiceType forKey:kAWECATTSVoiceType];
     if (self.voiceName) [d setObject:self.voiceName forKey:kAWECATTSVoiceName];
+    if (self.voiceType) [d setObject:self.voiceType forKey:kAWECATTSVolcanoVoiceType];
+    if (self.voiceName) [d setObject:self.voiceName forKey:kAWECATTSVolcanoVoiceName];
     [d setFloat:self.speedRatio forKey:kAWECATTSSpeedRatio];
     [d setFloat:self.volumeRatio forKey:kAWECATTSVolumeRatio];
     [d setFloat:self.pitchRatio forKey:kAWECATTSPitchRatio];
+    [d setObject:self.contextText ?: @"" forKey:kAWECATTSContextText];
+    [d setObject:[AWECATTSManager canonicalDialect:self.explicitDialect] forKey:kAWECATTSDialect];
+    [d setInteger:self.silenceDurationMs forKey:kAWECATTSSilenceMs];
     if (self.lastSynthesizedPath) [d setObject:self.lastSynthesizedPath forKey:kAWECATTSLastPath];
     [d synchronize];
 }
 
 - (void)loadConfig {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    // 后端选择
-    self.ttsProvider = [d integerForKey:kAWECATTSProvider];
-    // 火山引擎
-    self.appID = [d objectForKey:kAWECATTSAppID];
-    self.accessToken = [d objectForKey:kAWECATTSAccessToken];
-    self.cluster = [d objectForKey:kAWECATTSCluster];
-    // 千问
-    self.qwenAPIKey = [d objectForKey:kAWECATTSQwenAPIKey];
-    // 通用
+    self.appID = AWECATrim([d objectForKey:kAWECATTSAppID]);
+    self.accessToken = AWECATrim([d objectForKey:kAWECATTSAccessToken]);
     self.voiceType = [d objectForKey:kAWECATTSVoiceType];
     self.voiceName = [d objectForKey:kAWECATTSVoiceName];
 
     float sp = [d floatForKey:kAWECATTSSpeedRatio];
     float vo = [d floatForKey:kAWECATTSVolumeRatio];
-    float pi = [d floatForKey:kAWECATTSPitchRatio];
-    // 没存过就给默认值
-    self.speedRatio = (sp > 0.01) ? sp : 1.0;
-    self.volumeRatio = (vo > 0.01) ? vo : 1.0;
-    self.pitchRatio = (pi > 0.01) ? pi : 1.0;
+    self.speedRatio = (sp > 0.01f) ? sp : 1.0f;
+    self.volumeRatio = (vo > 0.01f) ? vo : 1.0f;
+    id pitchObj = [d objectForKey:kAWECATTSPitchRatio];
+    self.pitchRatio = pitchObj ? [pitchObj floatValue] : 1.0f;
+    if (self.pitchRatio < 0.0f) self.pitchRatio = 0.0f;
+    if (self.pitchRatio > 2.0f) self.pitchRatio = 2.0f;
+    self.contextText = [d objectForKey:kAWECATTSContextText] ?: @"";
+    self.explicitDialect = [AWECATTSManager canonicalDialect:[d objectForKey:kAWECATTSDialect]];
+    self.silenceDurationMs = [d integerForKey:kAWECATTSSilenceMs];
 
     self.lastSynthesizedPath = [d objectForKey:kAWECATTSLastPath];
 }

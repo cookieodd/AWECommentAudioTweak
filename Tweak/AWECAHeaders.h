@@ -1,11 +1,11 @@
-// AWECommentAudioTweak - runtime 扒出来的类声明
+// 抖音类声明
 // @cookieodd | github.com/cookieodd | t.me/cookieodd
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-// ==================== 前向声明 ====================
+// 前向声明
 
 @class AWECommentAudioModel;
 @class AWECommentModel;
@@ -17,7 +17,7 @@
 @class AWECommentLongPressPanelCommonModel;
 @class AWECommentLongPressPanelBizParam;
 
-// ==================== AWECommentAudioModel - 语音消息的数据模型 ====================
+// 语音数据
 
 @interface AWECommentAudioModel : NSObject
 @property (copy, nonatomic) NSString *audioFilePath;
@@ -31,7 +31,7 @@
 @property (nonatomic) unsigned long long audioStatus;
 @end
 
-// ==================== AWECommentModel - 评论本体 ====================
+// 评论模型
 
 @interface AWECommentModel : NSObject
 @property (copy, nonatomic) NSString *commentID;
@@ -39,7 +39,7 @@
 @property (nonatomic) long long duration;
 @end
 
-// ==================== AWECommentAudioPlayer - 底层播放器 ====================
+// 播放器
 
 @interface AWECommentAudioPlayer : NSObject
 @property (copy, nonatomic) NSString *localUrlString;
@@ -52,7 +52,7 @@
 - (void)pausePlay;
 @end
 
-// ==================== AWECommentAudioPlayerManager - 播放调度 ====================
+// 播放调度
 
 @interface AWECommentAudioPlayerManager : NSObject
 @property (strong, nonatomic) AWECommentAudioPlayer *player;
@@ -64,7 +64,7 @@
 - (void)stopAudioWithIsForce:(BOOL)arg1;
 @end
 
-// ==================== AWECommentAudioRecorder - 录音器 ====================
+// 录音器
 
 @interface AWECommentAudioRecorder : NSObject
 @property (strong, nonatomic) NSURL *url;
@@ -79,16 +79,18 @@
 - (void)cancel;
 @end
 
-// ==================== AWECommentAudioRecorderController - 录音控制 ====================
+// 录音控制
 
 @interface AWECommentAudioRecorderController : NSObject
 @property (strong, nonatomic) AWECommentAudioRecorder *recorder;
 @property (copy, nonatomic) NSString *audioFilePath;
 @property (weak, nonatomic) id delegate;
 - (void)audioRecorderDidFinishRecording:(id)arg1 success:(BOOL)arg2 error:(id)arg3;
+- (void)audioRecorderStartRecord:(id)arg1 error:(id)arg2;
+- (void)clear;
 @end
 
-// ==================== 长按菜单相关 ====================
+// 长按菜单
 
 @interface AWECommentLongPressPanelCommonModel : NSObject
 @property (copy, nonatomic) NSString *tag;
@@ -117,13 +119,13 @@
 - (id)containerSheet;
 @end
 
-// ==================== AWECommentLongPressPanelContext - 长按上下文 ====================
+// 长按上下文
 
 @interface AWECommentLongPressPanelContext : NSObject
 @property (strong, nonatomic) AWECommentLongPressPanelParam *params;
 @end
 
-// ==================== AWEBaseListSectionViewModel - 菜单数据源 ====================
+// 菜单数据源
 
 @interface AWEBaseListSectionViewModel : NSObject
 @property (copy, nonatomic) NSArray *modelsArray;
@@ -135,7 +137,7 @@
 - (void)tappedCommonElementWithID:(id)arg1;
 @end
 
-// ==================== 输入栏相关 ====================
+// 输入栏
 
 @interface AWECommentAudioContentView : UIView
 @property (nonatomic) double duration;
@@ -149,20 +151,20 @@
 + (id)averageWaveArrWithWave:(id)arg1;
 @end
 
-// AWEBaseElement 基类
+// 元素基类
 @interface AWEBaseElement : NSObject
 - (UIView *)view;
 @end
 
-// AWEBaseElementView
+// 元素视图
 @interface AWEBaseElementView : UIView
 @end
 
-// AWEElementStackView
+// 元素栈
 @interface AWEElementStackView : UIView
 @end
 
-// ==================== 评论输入框按钮元素 ====================
+// 输入栏按钮
 
 // 图片按钮
 @interface AWECommentInputViewSwiftImpl_CommentImageIconElement : AWEBaseElement
@@ -184,7 +186,7 @@
 @interface AWECommentInputViewSwiftImpl_CommentPoiIconElement : AWEBaseElement
 @end
 
-// ==================== 播放控制器 ====================
+// 播放控制
 
 @interface AWECommentListAudioPlayerController : NSObject
 @property (strong, nonatomic) AWECommentAudioPlayerManager *playerManager;
@@ -194,7 +196,7 @@
 - (void)stopAudioWithCommentModel:(id)arg1 isForce:(BOOL)arg2;
 @end
 
-// ==================== AWECommentAudioUploadManager - 上传管理 ====================
+// 上传管理
 
 @interface AWECommentAudioUploadManager : NSObject
 + (id)sharedManager;
@@ -203,7 +205,7 @@
 - (void)startUploadAudioWithFilePath:(id)arg1;
 @end
 
-// ==================== AWEUIThemeManager - 主题管理 ====================
+// 主题管理
 
 @interface AWEUIThemeManager : NSObject
 + (id)sharedInstance;

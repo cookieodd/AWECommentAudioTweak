@@ -1,4 +1,4 @@
-// 下载管理器impl，CDN直链下载简单粗暴
+// 语音下载
 // @cookieodd | github.com/cookieodd | t.me/cookieodd
 
 #import "AWECADownloadManager.h"

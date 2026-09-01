@@ -1,3 +1,13 @@
 .DS_Store
 .theos/
 packages/
+*.dylib
+!AWECommentAudioTweak.dylib
+settings-preview.html
+抖音_ViewHierarchy*.txt
+产品动态.md
+录音文件识别*.md
+音频生成HTTP.md
+模型列表.md
+音色列表.md
+Docs/《*
